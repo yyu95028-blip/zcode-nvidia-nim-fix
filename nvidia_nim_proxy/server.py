@@ -1073,7 +1073,7 @@ class NIMProxyHandler(BaseHTTPRequestHandler):
             retry_after,
         )
 
-        if upstream_response.status == 429 or upstream_response.status >= 500:
+        if upstream_response.status >= 400:
             logger.warning(message, *args)
         else:
             logger.debug(message, *args)
