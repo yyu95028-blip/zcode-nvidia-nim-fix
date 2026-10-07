@@ -1,4 +1,4 @@
-```python
+
 """Local OpenAI-compatible proxy for NVIDIA NIM chat completions."""
 
 from __future__ import annotations
@@ -1510,4 +1510,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-```
