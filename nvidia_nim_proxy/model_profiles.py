@@ -31,7 +31,7 @@ _DEEPSEEK_V4 = ReasoningProfile(
 )
 # The GLM model cards document max as the default, but the hosted request schemas
 # do not expose an effort override. Do not infer wire support from the weights.
-_GLM_53 = ReasoningProfile(location="body", efforts=frozenset({"low", "high", "max"}), default="high")
+_GLM_53 = ReasoningProfile(location="body", efforts=frozenset({"low", "high", "max"}), default="max")
 _GPT_OSS = ReasoningProfile(location="body", efforts=frozenset({"low", "medium", "high"}))
 
 NVIDIA_REASONING_PROFILES = {
