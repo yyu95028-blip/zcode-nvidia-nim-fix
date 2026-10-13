@@ -9,6 +9,8 @@ import ipaddress
 import json
 import logging
 import os
+import queue
+import threading
 import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -56,6 +58,7 @@ MAX_REQUEST_BYTES = 10 * 1024 * 1024
 STREAM_CHUNK_SIZE = 8192
 STREAM_DIAGNOSTIC_SCAN_BYTES = 8 * 1024
 STREAM_DIAGNOSTIC_SCAN_EVENTS = 8
+STREAM_KEEPALIVE_SECONDS = 10.0
 HOP_BY_HOP_RESPONSE_HEADERS = {
     "connection",
     "keep-alive",
@@ -1147,31 +1150,22 @@ class NIMProxyHandler(BaseHTTPRequestHandler):
             return
 
         if self.config.tool_call_text_mode == "diagnostic" and 200 <= upstream_response.status < 300:
-            prefix_scan = read_stream_prefix_for_tool_call_detection(upstream_response.read1)
-            if prefix_scan.tool_call_text_leak:
-                logger.warning(
-                    "Streaming response contains plain-text tool_call tags. "
-                    "Returning readable diagnostic response instead of raw tool-call markup."
-                )
-                self._send_tool_call_text_diagnostic(stream=True)
-                return
-
+            # Send SSE headers immediately. GLM-5.3 can spend a long time
+            # reasoning before its first data event; delaying the headers until
+            # that event would leave Janitor AI with a silent connection. The
+            # relay below sends standard SSE keepalive comments while NVIDIA is
+            # still thinking.
             NIMProxyHandler._begin_client_response(self)
             self.send_response(upstream_response.status, upstream_response.reason)
             for header, value in upstream_response.getheaders():
-                if header.lower() not in HOP_BY_HOP_RESPONSE_HEADERS and header.lower() != "content-length":
+                header_lower = header.lower()
+                if header_lower not in HOP_BY_HOP_RESPONSE_HEADERS and header_lower != "content-length":
                     self.send_header(header, value)
             self.end_headers()
-            if prefix_scan.buffered:
-                self.wfile.write(prefix_scan.buffered)
-                self.wfile.flush()
-
-            if not prefix_scan.upstream_exhausted:
-                self._relay_remaining_stream_after_headers(
-                    upstream_response,
-                    warn_on_tool_call_text=True,
-                )
-
+            self._relay_remaining_stream_after_headers(
+                upstream_response,
+                warn_on_tool_call_text=True,
+            )
             self.close_connection = True
             return
 
@@ -1195,12 +1189,58 @@ class NIMProxyHandler(BaseHTTPRequestHandler):
         *,
         warn_on_tool_call_text: bool = False,
     ) -> None:
+        """Relay an SSE stream while sending keepalive comments during silent periods.
+
+        GLM-5.3 can spend a long time reasoning before producing the next SSE data
+        event. Janitor AI may interpret a completely silent HTTP stream as a dead
+        bot even though NVIDIA is still working. A separate reader thread lets the
+        proxy send standard SSE comment frames without interrupting the upstream
+        read. SSE clients ignore comment lines, so these frames do not become model
+        content or alter the reasoning/output stream.
+        """
         tool_call_warning_logged = False
+        stream_queue: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=2)
+
+        def read_upstream() -> None:
+            try:
+                while True:
+                    chunk = upstream_response.read1(STREAM_CHUNK_SIZE)
+                    if not chunk:
+                        stream_queue.put(("done", None))
+                        return
+                    stream_queue.put(("data", chunk))
+            except BaseException as exc:
+                stream_queue.put(("error", exc))
+
+        reader = threading.Thread(
+            target=read_upstream,
+            name="nim-stream-reader",
+            daemon=True,
+        )
+        reader.start()
 
         while True:
-            chunk = upstream_response.read1(STREAM_CHUNK_SIZE)
-            if not chunk:
+            try:
+                kind, value = stream_queue.get(timeout=STREAM_KEEPALIVE_SECONDS)
+            except queue.Empty:
+                # Standard SSE comment frame. It is intentionally not a data event,
+                # so OpenAI-compatible clients should ignore it while keeping the
+                # HTTP/SSE connection active.
+                self.wfile.write(b": keep-alive\n\n")
+                self.wfile.flush()
+                continue
+
+            if kind == "done":
                 break
+            if kind == "error":
+                exc = value
+                if isinstance(exc, BaseException):
+                    raise exc
+                raise RuntimeError("unknown upstream stream reader error")
+
+            chunk = value
+            if not isinstance(chunk, bytes):
+                raise RuntimeError("upstream stream reader returned non-bytes data")
             if (
                 warn_on_tool_call_text
                 and not tool_call_warning_logged
