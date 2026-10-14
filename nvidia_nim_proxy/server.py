@@ -571,6 +571,9 @@ class NIMProxyHandler(BaseHTTPRequestHandler):
             sanitized.stripped_keys,
         )
 
+        # Keep the requested model available to the streaming relay diagnostics.
+        self._stream_model = str(sanitized.body.get("model", "unknown"))
+
         try:
             self._forward_to_nim(
                 sanitized.body,
@@ -1189,17 +1192,27 @@ class NIMProxyHandler(BaseHTTPRequestHandler):
         *,
         warn_on_tool_call_text: bool = False,
     ) -> None:
-        """Relay an SSE stream while sending keepalive comments during silent periods.
+        """Relay SSE with keepalives and useful diagnostics for long reasoning runs.
 
-        GLM-5.3 can spend a long time reasoning before producing the next SSE data
-        event. Janitor AI may interpret a completely silent HTTP stream as a dead
-        bot even though NVIDIA is still working. A separate reader thread lets the
-        proxy send standard SSE comment frames without interrupting the upstream
-        read. SSE clients ignore comment lines, so these frames do not become model
-        content or alter the reasoning/output stream.
+        A dedicated reader thread can wait on NVIDIA without blocking this thread
+        from sending SSE comment heartbeats to the client. Heartbeats are comments,
+        not data events, so OpenAI-compatible clients should ignore them.
         """
         tool_call_warning_logged = False
         stream_queue: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=2)
+        started_at = time.monotonic()
+        last_upstream_data_at = started_at
+        first_upstream_data_at: float | None = None
+        bytes_sent = 0
+        heartbeat_count = 0
+        last_status_log = started_at
+        model = getattr(self, "_stream_model", "unknown")
+
+        logger.info(
+            "SSE relay started model=%r keepalive_seconds=%s",
+            model,
+            STREAM_KEEPALIVE_SECONDS,
+        )
 
         def read_upstream() -> None:
             try:
@@ -1219,40 +1232,100 @@ class NIMProxyHandler(BaseHTTPRequestHandler):
         )
         reader.start()
 
-        while True:
-            try:
-                kind, value = stream_queue.get(timeout=STREAM_KEEPALIVE_SECONDS)
-            except queue.Empty:
-                # Standard SSE comment frame. It is intentionally not a data event,
-                # so OpenAI-compatible clients should ignore it while keeping the
-                # HTTP/SSE connection active.
-                self.wfile.write(b": keep-alive\n\n")
+        try:
+            while True:
+                try:
+                    kind, value = stream_queue.get(timeout=STREAM_KEEPALIVE_SECONDS)
+                except queue.Empty:
+                    now = time.monotonic()
+                    # Standard SSE comment frame; it does not alter model output.
+                    self.wfile.write(b": keep-alive\n\n")
+                    self.wfile.flush()
+                    heartbeat_count += 1
+
+                    if now - last_status_log >= 60:
+                        logger.info(
+                            "SSE relay alive model=%r elapsed_seconds=%d "
+                            "upstream_idle_seconds=%d heartbeats=%d bytes_sent=%d",
+                            model,
+                            int(now - started_at),
+                            int(now - last_upstream_data_at),
+                            heartbeat_count,
+                            bytes_sent,
+                        )
+                        last_status_log = now
+                    continue
+
+                if kind == "done":
+                    logger.info(
+                        "SSE relay completed model=%r elapsed_seconds=%.1f "
+                        "first_data_seconds=%s bytes_sent=%d heartbeats=%d",
+                        model,
+                        time.monotonic() - started_at,
+                        (
+                            f"{first_upstream_data_at - started_at:.1f}"
+                            if first_upstream_data_at is not None
+                            else "none"
+                        ),
+                        bytes_sent,
+                        heartbeat_count,
+                    )
+                    return
+
+                if kind == "error":
+                    exc = value
+                    logger.error(
+                        "SSE upstream reader failed model=%r elapsed_seconds=%.1f error=%s",
+                        model,
+                        time.monotonic() - started_at,
+                        type(exc).__name__,
+                    )
+                    if isinstance(exc, BaseException):
+                        raise exc
+                    raise RuntimeError("unknown upstream stream reader error")
+
+                chunk = value
+                if not isinstance(chunk, bytes):
+                    raise RuntimeError("upstream stream reader returned non-bytes data")
+
+                now = time.monotonic()
+                last_upstream_data_at = now
+                if first_upstream_data_at is None:
+                    first_upstream_data_at = now
+                    logger.info(
+                        "SSE first upstream data model=%r seconds_until_first_data=%.1f",
+                        model,
+                        now - started_at,
+                    )
+
+                if (
+                    warn_on_tool_call_text
+                    and not tool_call_warning_logged
+                    and contains_tool_call_text_leak(chunk)
+                ):
+                    logger.warning(
+                        "Streaming response contains plain-text tool_call tags; model=%r",
+                        model,
+                    )
+                    tool_call_warning_logged = True
+
+                self.wfile.write(chunk)
                 self.wfile.flush()
-                continue
+                bytes_sent += len(chunk)
 
-            if kind == "done":
-                break
-            if kind == "error":
-                exc = value
-                if isinstance(exc, BaseException):
-                    raise exc
-                raise RuntimeError("unknown upstream stream reader error")
-
-            chunk = value
-            if not isinstance(chunk, bytes):
-                raise RuntimeError("upstream stream reader returned non-bytes data")
-            if (
-                warn_on_tool_call_text
-                and not tool_call_warning_logged
-                and contains_tool_call_text_leak(chunk)
-            ):
-                logger.warning(
-                    "Streaming response contains plain-text tool_call tags. "
-                    "This usually means the selected model is not emitting real OpenAI tool_calls."
-                )
-                tool_call_warning_logged = True
-            self.wfile.write(chunk)
-            self.wfile.flush()
+        except CLIENT_DISCONNECT_ERRORS:
+            logger.warning(
+                "SSE client disconnected model=%r elapsed_seconds=%.1f "
+                "upstream_idle_seconds=%.1f bytes_sent=%d heartbeats=%d "
+                "upstream_reader_alive=%s",
+                model,
+                time.monotonic() - started_at,
+                time.monotonic() - last_upstream_data_at,
+                bytes_sent,
+                heartbeat_count,
+                reader.is_alive(),
+            )
+            raise
 
     def _relay_remaining_stream_after_headers(
         self,
