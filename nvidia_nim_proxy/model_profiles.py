@@ -1,4 +1,4 @@
-⁸
+
 """Verified NVIDIA hosted-API reasoning capabilities, not model-name guesses.
 
 Author: Levent Dogan
