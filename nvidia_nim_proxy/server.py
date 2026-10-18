@@ -1,3 +1,4 @@
+
 """Local OpenAI-compatible proxy for NVIDIA NIM chat completions."""
 
 from __future__ import annotations
@@ -58,7 +59,8 @@ STREAM_CHUNK_SIZE = 8192
 STREAM_DIAGNOSTIC_SCAN_BYTES = 8 * 1024
 STREAM_DIAGNOSTIC_SCAN_EVENTS = 8
 STREAM_KEEPALIVE_SECONDS = 10.0
-STREAM_READER_PUT_TIMEOUT_SECONDS = 1.0
+STREAM_DIAGNOSTIC_SLOW_GAP_SECONDS = 5.0
+STREAM_DIAGNOSTIC_ALIVE_LOG_SECONDS = 60.0
 HOP_BY_HOP_RESPONSE_HEADERS = {
     "connection",
     "keep-alive",
@@ -69,17 +71,8 @@ HOP_BY_HOP_RESPONSE_HEADERS = {
     "transfer-encoding",
     "upgrade",
 }
-CLIENT_DISCONNECT_ERRORS = (
-    BrokenPipeError,
-    ConnectionAbortedError,
-    ConnectionResetError,
-)
-TOOL_CALL_LEAK_MARKERS = (
-    b"<tool_call",
-    b"</tool_call",
-    b"&lt;tool_call",
-    b"&lt;/tool_call",
-)
+CLIENT_DISCONNECT_ERRORS = (BrokenPipeError, ConnectionAbortedError, ConnectionResetError)
+TOOL_CALL_LEAK_MARKERS = (b"<tool_call", b"</tool_call", b"&lt;tool_call", b"&lt;/tool_call")
 TOOL_CALL_TEXT_DIAGNOSTIC = (
     "Provider/model compatibility issue: NVIDIA NIM returned tool-call markup as normal "
     "assistant text instead of real OpenAI-compatible tool_calls. The proxy did not execute "
@@ -522,21 +515,15 @@ class NIMProxyHandler(BaseHTTPRequestHandler):
                     self.config.credential_broker.resolve_direct_key(authorization)
             except PermissionError:
                 self._send_proxy_error(
-                    401,
-                    code="invalid_api_key",
-                    message="Invalid or missing local bearer credential",
+                    401, code="invalid_api_key", message="Invalid or missing local bearer credential"
                 )
                 return
-
             catalog = self.config.model_catalog
             if catalog is None:
                 self._send_proxy_error(
-                    503,
-                    code="model_catalog_disabled",
-                    message="Model discovery is disabled",
+                    503, code="model_catalog_disabled", message="Model discovery is disabled"
                 )
                 return
-
             payload = catalog.payload()
             if payload is None:
                 self._send_proxy_error(
@@ -546,12 +533,7 @@ class NIMProxyHandler(BaseHTTPRequestHandler):
                     retry_after="5",
                 )
                 return
-
-            self._send_json(
-                200,
-                payload,
-                headers={"Cache-Control": "no-store"},
-            )
+            self._send_json(200, payload, headers={"Cache-Control": "no-store"})
             return
 
         self._send_json(404, {"error": "not_found"})
@@ -582,10 +564,7 @@ class NIMProxyHandler(BaseHTTPRequestHandler):
             )
 
         if sanitized.reasoning_policy:
-            logger.debug(
-                "NVIDIA NIM reasoning policy: %s",
-                sanitized.reasoning_policy,
-            )
+            logger.debug("NVIDIA NIM reasoning policy: %s", sanitized.reasoning_policy)
 
         logger.debug(
             "Forwarding chat completion request model=%r stream=%r stripped_keys=%s",
@@ -594,17 +573,13 @@ class NIMProxyHandler(BaseHTTPRequestHandler):
             sanitized.stripped_keys,
         )
 
-        self._stream_model = str(sanitized.body.get("model", "unknown"))
-
         try:
             self._forward_to_nim(
                 sanitized.body,
                 client_authorization=self.headers.get("Authorization"),
             )
         except CLIENT_DISCONNECT_ERRORS:
-            logger.info(
-                "Client disconnected before proxy response completed"
-            )
+            logger.info("Client disconnected before proxy response completed")
 
     def log_message(self, fmt: str, *args: Any) -> None:
         logger.info("%s - %s", self.client_address[0], fmt % args)
@@ -623,7 +598,6 @@ class NIMProxyHandler(BaseHTTPRequestHandler):
             raise ValueError("request body too large")
 
         raw_body = self.rfile.read(content_length)
-
         try:
             decoded = json.loads(raw_body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -687,7 +661,6 @@ class NIMProxyHandler(BaseHTTPRequestHandler):
             return
 
         model = str(body.get("model", ""))
-
         try:
             lease = self.config.request_scheduler.acquire(
                 upstream_request.api_key_fingerprint,
@@ -730,12 +703,8 @@ class NIMProxyHandler(BaseHTTPRequestHandler):
             lease.queue_position,
             lease.wait_ms,
         )
-
         try:
-            self._perform_direct_attempt(
-                body,
-                upstream_request,
-            )
+            self._perform_direct_attempt(body, upstream_request)
         finally:
             lease.release()
             logger.info(
@@ -752,11 +721,7 @@ class NIMProxyHandler(BaseHTTPRequestHandler):
         try:
             attempt = self._open_upstream_attempt(upstream_request)
         except (TimeoutError, OSError) as exc:
-            self._handle_relay_transport_error(
-                body,
-                upstream_request,
-                exc,
-            )
+            self._handle_relay_transport_error(body, upstream_request, exc)
             return
 
         try:
@@ -766,27 +731,13 @@ class NIMProxyHandler(BaseHTTPRequestHandler):
                 upstream_request=upstream_request,
                 elapsed_ms=attempt.elapsed_ms,
             )
-
             self._relay_upstream_response(
                 attempt.response,
                 stream=upstream_request.stream,
+                model=body.get("model"),
             )
-
-        except CLIENT_DISCONNECT_ERRORS:
-            logger.info(
-                "Downstream client disconnected during relay; "
-                "closing NVIDIA upstream connection model=%r",
-                body.get("model"),
-            )
-            raise
-
         except (TimeoutError, OSError) as exc:
-            self._handle_relay_transport_error(
-                body,
-                upstream_request,
-                exc,
-            )
-
+            self._handle_relay_transport_error(body, upstream_request, exc)
         finally:
             attempt.connection.close()
 
@@ -825,10 +776,7 @@ class NIMProxyHandler(BaseHTTPRequestHandler):
             try:
                 lease = key_pool.acquire(frozenset(attempted))
             except PoolQueueFullError:
-                logger.warning(
-                    "Queue event=queue_full scope=pool model=%r",
-                    model,
-                )
+                logger.warning("Queue event=queue_full scope=pool model=%r", model)
                 self._send_proxy_error(
                     429,
                     code="proxy_queue_full",
@@ -836,24 +784,16 @@ class NIMProxyHandler(BaseHTTPRequestHandler):
                     retry_after="5",
                 )
                 return
-
             except PoolWaitTimeoutError:
-                logger.warning(
-                    "Queue event=queue_timeout scope=pool model=%r",
-                    model,
-                )
+                logger.warning("Queue event=queue_timeout scope=pool model=%r", model)
                 self._send_proxy_error(
                     504,
                     code="proxy_queue_timeout",
                     message="request timed out while waiting for an NVIDIA key",
                 )
                 return
-
             except PoolUnavailableError:
-                logger.warning(
-                    "Queue event=pool_unavailable model=%r",
-                    model,
-                )
+                logger.warning("Queue event=pool_unavailable model=%r", model)
                 self._send_proxy_error(
                     503,
                     code="nvidia_key_pool_unavailable",
@@ -863,7 +803,6 @@ class NIMProxyHandler(BaseHTTPRequestHandler):
                 return
 
             attempted.add(lease.fingerprint)
-
             logger.info(
                 (
                     "Queue event=admitted scope=pool model=%r "
@@ -875,9 +814,7 @@ class NIMProxyHandler(BaseHTTPRequestHandler):
                 lease.wait_ms,
                 len(attempted),
             )
-
             attempt: UpstreamAttempt | None = None
-
             try:
                 try:
                     upstream_request = build_upstream_chat_request(
@@ -892,26 +829,19 @@ class NIMProxyHandler(BaseHTTPRequestHandler):
                         message="invalid upstream base URL",
                     )
                     return
-
                 try:
-                    attempt = self._open_upstream_attempt(
-                        upstream_request
-                    )
+                    attempt = self._open_upstream_attempt(upstream_request)
                 except (TimeoutError, OSError) as exc:
                     can_failover = (
                         five_xx_failovers < key_pool.max_5xx_failovers
-                        and key_pool.has_untried_candidate(
-                            frozenset(attempted)
-                        )
+                        and key_pool.has_untried_candidate(frozenset(attempted))
                     )
-
                     if can_failover:
                         five_xx_failovers += 1
                         logger.warning(
                             (
-                                "Queue event=failover reason=transport_error "
-                                "model=%r api_key_fingerprint=%s "
-                                "attempt=%s error=%s"
+                                "Queue event=failover reason=transport_error model=%r "
+                                "api_key_fingerprint=%s attempt=%s error=%s"
                             ),
                             model,
                             lease.fingerprint,
@@ -926,19 +856,12 @@ class NIMProxyHandler(BaseHTTPRequestHandler):
                         upstream_request,
                         error=exc.__class__.__name__,
                     )
-
-                    status_code = (
-                        504
-                        if isinstance(exc, TimeoutError)
-                        else 502
-                    )
-
+                    status_code = 504 if isinstance(exc, TimeoutError) else 502
                     error_code = (
                         "upstream_timeout"
                         if status_code == 504
                         else "upstream_request_failed"
                     )
-
                     self._send_proxy_error(
                         status_code,
                         code=error_code,
@@ -946,31 +869,23 @@ class NIMProxyHandler(BaseHTTPRequestHandler):
                     )
                     return
 
-                retry_after = attempt.response.getheader(
-                    "Retry-After"
-                )
-
+                retry_after = attempt.response.getheader("Retry-After")
                 self._log_upstream_response(
                     attempt.response,
                     body=body,
                     upstream_request=upstream_request,
                     elapsed_ms=attempt.elapsed_ms,
                 )
-
                 should_failover = (
                     key_pool.should_failover(
                         attempt.response.status,
                         five_xx_failovers=five_xx_failovers,
                     )
-                    and key_pool.has_untried_candidate(
-                        frozenset(attempted)
-                    )
+                    and key_pool.has_untried_candidate(frozenset(attempted))
                 )
-
                 if should_failover:
                     if 500 <= attempt.response.status <= 599:
                         five_xx_failovers += 1
-
                     logger.warning(
                         (
                             "Queue event=failover status=%s model=%r "
@@ -981,7 +896,6 @@ class NIMProxyHandler(BaseHTTPRequestHandler):
                         lease.fingerprint,
                         len(attempted),
                     )
-
                     lease.release(
                         status=attempt.response.status,
                         retry_after=retry_after,
@@ -992,24 +906,8 @@ class NIMProxyHandler(BaseHTTPRequestHandler):
                     self._relay_upstream_response(
                         attempt.response,
                         stream=upstream_request.stream,
+                        model=body.get("model"),
                     )
-
-                except CLIENT_DISCONNECT_ERRORS:
-                    logger.info(
-                        (
-                            "Downstream client disconnected during pooled "
-                            "relay; closing NVIDIA upstream connection "
-                            "model=%r api_key_fingerprint=%s"
-                        ),
-                        model,
-                        lease.fingerprint,
-                    )
-                    lease.release(
-                        status=attempt.response.status,
-                        retry_after=retry_after,
-                    )
-                    raise
-
                 except (TimeoutError, OSError) as exc:
                     if self._client_response_has_started():
                         self._handle_relay_transport_error(
@@ -1026,27 +924,20 @@ class NIMProxyHandler(BaseHTTPRequestHandler):
                     can_failover = (
                         200 <= attempt.response.status <= 299
                         and five_xx_failovers < key_pool.max_5xx_failovers
-                        and key_pool.has_untried_candidate(
-                            frozenset(attempted)
-                        )
+                        and key_pool.has_untried_candidate(frozenset(attempted))
                     )
-
                     if can_failover:
                         five_xx_failovers += 1
-
                         logger.warning(
                             (
-                                "Queue event=failover "
-                                "reason=response_read_error "
-                                "model=%r api_key_fingerprint=%s "
-                                "attempt=%s error=%s"
+                                "Queue event=failover reason=response_read_error model=%r "
+                                "api_key_fingerprint=%s attempt=%s error=%s"
                             ),
                             model,
                             lease.fingerprint,
                             len(attempted),
                             exc.__class__.__name__,
                         )
-
                         lease.release()
                         continue
 
@@ -1057,24 +948,17 @@ class NIMProxyHandler(BaseHTTPRequestHandler):
                     )
                     lease.release()
                     return
-
                 lease.release(
                     status=attempt.response.status,
                     retry_after=retry_after,
                 )
                 return
-
             finally:
                 if attempt is not None:
                     attempt.connection.close()
-
                 lease.release_if_active()
-
                 logger.info(
-                    (
-                        "Queue event=released scope=pool model=%r "
-                        "api_key_fingerprint=%s"
-                    ),
+                    "Queue event=released scope=pool model=%r api_key_fingerprint=%s",
                     model,
                     lease.fingerprint,
                 )
@@ -1088,14 +972,11 @@ class NIMProxyHandler(BaseHTTPRequestHandler):
             if upstream_request.use_tls
             else http.client.HTTPConnection
         )
-
         connection = connection_cls(
             upstream_request.netloc,
             timeout=self.config.upstream_timeout_seconds,
         )
-
         started_at = time.monotonic()
-
         try:
             connection.request(
                 "POST",
@@ -1112,9 +993,7 @@ class NIMProxyHandler(BaseHTTPRequestHandler):
             connection=connection,
             response=upstream_response,
             request=upstream_request,
-            elapsed_ms=int(
-                (time.monotonic() - started_at) * 1000
-            ),
+            elapsed_ms=int((time.monotonic() - started_at) * 1000),
         )
 
     def _log_upstream_transport_error(
@@ -1136,13 +1015,7 @@ class NIMProxyHandler(BaseHTTPRequestHandler):
         )
 
     def _client_response_has_started(self) -> bool:
-        return bool(
-            getattr(
-                self,
-                "_client_response_started",
-                False,
-            )
-        )
+        return bool(getattr(self, "_client_response_started", False))
 
     def _begin_client_response(self) -> None:
         self._client_response_started = True
@@ -1153,24 +1026,11 @@ class NIMProxyHandler(BaseHTTPRequestHandler):
         upstream_request: UpstreamRequest,
         exc: OSError,
     ) -> None:
-        if isinstance(exc, CLIENT_DISCONNECT_ERRORS):
-            logger.info(
-                (
-                    "Downstream client disconnected; relay stopped "
-                    "model=%r stream=%r error=%s"
-                ),
-                body.get("model"),
-                upstream_request.stream,
-                exc.__class__.__name__,
-            )
-            self.close_connection = True
-            return
-
         if self._client_response_has_started():
             logger.error(
                 (
-                    "HTTP relay failed after client response started; "
-                    "model=%r stream=%r api_key_fingerprint=%s error=%s"
+                    "HTTP relay failed after client response started; model=%r stream=%r "
+                    "api_key_fingerprint=%s error=%s"
                 ),
                 body.get("model"),
                 upstream_request.stream,
@@ -1185,7 +1045,6 @@ class NIMProxyHandler(BaseHTTPRequestHandler):
             upstream_request,
             error=exc.__class__.__name__,
         )
-
         if isinstance(exc, TimeoutError):
             self._send_proxy_error(
                 504,
@@ -1208,13 +1067,10 @@ class NIMProxyHandler(BaseHTTPRequestHandler):
         elapsed_ms: int,
     ) -> None:
         retry_after = upstream_response.getheader("Retry-After")
-
         message = (
-            "NVIDIA NIM upstream response status=%s reason=%r "
-            "elapsed_ms=%s model=%r stream=%r "
-            "api_key_fingerprint=%s retry_after=%r"
+            "NVIDIA NIM upstream response status=%s reason=%r elapsed_ms=%s "
+            "model=%r stream=%r api_key_fingerprint=%s retry_after=%r"
         )
-
         args = (
             upstream_response.status,
             upstream_response.reason,
@@ -1235,23 +1091,22 @@ class NIMProxyHandler(BaseHTTPRequestHandler):
         upstream_response: http.client.HTTPResponse,
         *,
         stream: bool,
+        model: str | None = None,
     ) -> None:
+        # NVIDIA can return a normal JSON error body even when the original
+        # request asked for streaming. Read and log that body before relaying it.
         if not (200 <= upstream_response.status < 300):
             response_body = upstream_response.read()
 
+            # Log only a bounded UTF-8 representation of the provider error.
+            # This is diagnostic-only and avoids dumping huge response bodies.
             try:
-                error_body = response_body.decode(
-                    "utf-8",
-                    errors="replace",
-                )
+                error_body = response_body.decode("utf-8", errors="replace")
             except Exception:
                 error_body = repr(response_body)
 
             if len(error_body) > 2048:
-                error_body = (
-                    error_body[:2048]
-                    + "...[truncated]"
-                )
+                error_body = error_body[:2048] + "...[truncated]"
 
             logger.warning(
                 "NVIDIA NIM upstream error body status=%s model_error=%s",
@@ -1260,122 +1115,77 @@ class NIMProxyHandler(BaseHTTPRequestHandler):
             )
 
             NIMProxyHandler._begin_client_response(self)
-
-            self.send_response(
-                upstream_response.status,
-                upstream_response.reason,
-            )
-
+            self.send_response(upstream_response.status, upstream_response.reason)
             for header, value in upstream_response.getheaders():
                 header_lower = header.lower()
-
                 if (
                     header_lower not in HOP_BY_HOP_RESPONSE_HEADERS
                     and header_lower != "content-length"
                 ):
                     self.send_header(header, value)
-
-            self.send_header(
-                "Content-Length",
-                str(len(response_body)),
-            )
+            self.send_header("Content-Length", str(len(response_body)))
             self.end_headers()
 
             if response_body:
                 self.wfile.write(response_body)
                 self.wfile.flush()
-
             return
 
         if not stream:
             response_body = upstream_response.read()
-
             if contains_tool_call_text_leak(response_body):
                 logger.warning(
                     "Upstream response contains plain-text tool_call tags. "
-                    "This usually means the selected model is not emitting "
-                    "real OpenAI tool_calls."
+                    "This usually means the selected model is not emitting real OpenAI tool_calls."
                 )
-
                 if (
                     self.config.tool_call_text_mode == "diagnostic"
                     and 200 <= upstream_response.status < 300
                 ):
-                    self._send_tool_call_text_diagnostic(
-                        stream=False
-                    )
+                    self._send_tool_call_text_diagnostic(stream=False)
                     return
-
             NIMProxyHandler._begin_client_response(self)
-
-            self.send_response(
-                upstream_response.status,
-                upstream_response.reason,
-            )
-
+            self.send_response(upstream_response.status, upstream_response.reason)
             for header, value in upstream_response.getheaders():
-                if (
-                    header.lower()
-                    not in HOP_BY_HOP_RESPONSE_HEADERS
-                    and header.lower() != "content-length"
-                ):
+                if header.lower() not in HOP_BY_HOP_RESPONSE_HEADERS and header.lower() != "content-length":
                     self.send_header(header, value)
-
-            self.send_header(
-                "Content-Length",
-                str(len(response_body)),
-            )
+            self.send_header("Content-Length", str(len(response_body)))
             self.end_headers()
-
             self.wfile.write(response_body)
             return
 
-        if (
-            self.config.tool_call_text_mode == "diagnostic"
-            and 200 <= upstream_response.status < 300
-        ):
+        if self.config.tool_call_text_mode == "diagnostic" and 200 <= upstream_response.status < 300:
+            # Send SSE headers immediately. GLM-5.3 can spend a long time
+            # reasoning before its first data event; delaying the headers until
+            # that event would leave Janitor AI with a silent connection. The
+            # relay below sends standard SSE keepalive comments while NVIDIA is
+            # still thinking.
             NIMProxyHandler._begin_client_response(self)
-
-            self.send_response(
-                upstream_response.status,
-                upstream_response.reason,
-            )
-
+            self.send_response(upstream_response.status, upstream_response.reason)
             for header, value in upstream_response.getheaders():
                 header_lower = header.lower()
-
-                if (
-                    header_lower not in HOP_BY_HOP_RESPONSE_HEADERS
-                    and header_lower != "content-length"
-                ):
+                if header_lower not in HOP_BY_HOP_RESPONSE_HEADERS and header_lower != "content-length":
                     self.send_header(header, value)
-
             self.end_headers()
-
             self._relay_remaining_stream_after_headers(
                 upstream_response,
                 warn_on_tool_call_text=True,
+                model=model,
             )
-
             self.close_connection = True
             return
 
         NIMProxyHandler._begin_client_response(self)
-
-        self.send_response(
-            upstream_response.status,
-            upstream_response.reason,
-        )
-
+        self.send_response(upstream_response.status, upstream_response.reason)
         for header, value in upstream_response.getheaders():
             if header.lower() not in HOP_BY_HOP_RESPONSE_HEADERS:
                 self.send_header(header, value)
-
         self.end_headers()
 
         self._relay_remaining_stream_after_headers(
             upstream_response,
             warn_on_tool_call_text=True,
+            model=model,
         )
 
         self.close_connection = True
@@ -1385,91 +1195,76 @@ class NIMProxyHandler(BaseHTTPRequestHandler):
         upstream_response: http.client.HTTPResponse,
         *,
         warn_on_tool_call_text: bool = False,
+        model: str | None = None,
     ) -> None:
-        """Relay SSE while keeping the downstream connection alive."""
+        """Relay SSE data, emit keepalives, and log stream timing diagnostics.
 
+        A dedicated reader thread allows this handler to send SSE comment frames
+        while NVIDIA is thinking. Comments are ignored by SSE clients and are not
+        exposed as model content. Diagnostic timestamps help distinguish a quiet
+        upstream stream from a downstream write/disconnect problem.
+        """
+        started_at = time.monotonic()
+        last_upstream_data_at: float | None = None
+        first_upstream_data_at: float | None = None
+        last_client_write_at = started_at
+        last_alive_log_at = started_at
+        total_bytes = 0
+        total_chunks = 0
+        total_heartbeats = 0
         tool_call_warning_logged = False
-
-        stream_queue: queue.Queue[
-            tuple[str, object]
-        ] = queue.Queue(maxsize=2)
-
+        stream_queue: queue.Queue[tuple[str, object, float]] = queue.Queue(maxsize=2)
         stop_event = threading.Event()
 
-        started_at = time.monotonic()
-        last_upstream_data_at = started_at
-        first_upstream_data_at: float | None = None
-
-        bytes_sent = 0
-        chunk_count = 0
-        heartbeat_count = 0
-
-        last_status_log = started_at
-
-        model = getattr(
-            self,
-            "_stream_model",
-            "unknown",
-        )
-
-        logger.info(
-            "SSE relay started model=%r keepalive_seconds=%s",
-            model,
-            STREAM_KEEPALIVE_SECONDS,
-        )
-
-        def close_upstream_response() -> None:
-            """Close the upstream response when the downstream client leaves."""
-
-            try:
-                upstream_response.close()
-            except Exception:
-                pass
-
-        def enqueue_event(
-            kind: str,
-            value: object,
-        ) -> bool:
-            """Put a reader event into the queue without getting stuck."""
-
+        def enqueue_event(kind: str, value: object, timestamp: float) -> bool:
+            """Queue an event without leaving the reader stuck during disconnect."""
             while not stop_event.is_set():
                 try:
-                    stream_queue.put(
-                        (kind, value),
-                        timeout=STREAM_READER_PUT_TIMEOUT_SECONDS,
-                    )
+                    stream_queue.put((kind, value, timestamp), timeout=0.25)
                     return True
                 except queue.Full:
                     continue
-
             return False
 
         def read_upstream() -> None:
+            reader_last_read_at: float | None = None
             try:
                 while not stop_event.is_set():
-                    chunk = upstream_response.read1(
-                        STREAM_CHUNK_SIZE
-                    )
+                    chunk = upstream_response.read1(STREAM_CHUNK_SIZE)
+                    read_at = time.monotonic()
+                    if reader_last_read_at is not None:
+                        read_gap = read_at - reader_last_read_at
+                        if read_gap >= STREAM_DIAGNOSTIC_SLOW_GAP_SECONDS:
+                            logger.info(
+                                "NVIDIA stream reader read gap model=%r gap_seconds=%.3f "
+                                "elapsed_seconds=%.1f",
+                                model,
+                                read_gap,
+                                read_at - started_at,
+                            )
+                    reader_last_read_at = read_at
 
                     if not chunk:
-                        enqueue_event(
-                            "done",
-                            None,
+                        logger.info(
+                            "NVIDIA upstream EOF model=%r elapsed_seconds=%.1f",
+                            model,
+                            read_at - started_at,
                         )
+                        enqueue_event("done", None, read_at)
                         return
 
-                    if not enqueue_event(
-                        "data",
-                        chunk,
-                    ):
+                    if first_upstream_data_at is None:
+                        logger.info(
+                            "NVIDIA first upstream data model=%r elapsed_seconds=%.3f "
+                            "first_chunk_bytes=%s",
+                            model,
+                            read_at - started_at,
+                            len(chunk),
+                        )
+                    if not enqueue_event("data", chunk, read_at):
                         return
-
             except BaseException as exc:
-                if not stop_event.is_set():
-                    enqueue_event(
-                        "error",
-                        exc,
-                    )
+                enqueue_event("error", exc, time.monotonic())
 
         reader = threading.Thread(
             target=read_upstream,
@@ -1477,211 +1272,122 @@ class NIMProxyHandler(BaseHTTPRequestHandler):
             daemon=True,
         )
         reader.start()
-
-        client_disconnected = False
+        completed = False
 
         try:
             while True:
                 try:
-                    kind, value = stream_queue.get(
+                    kind, value, event_at = stream_queue.get(
                         timeout=STREAM_KEEPALIVE_SECONDS
                     )
-
                 except queue.Empty:
                     now = time.monotonic()
-
-                    try:
-                        self.wfile.write(
-                            b": keep-alive\n\n"
-                        )
-                        self.wfile.flush()
-                    except CLIENT_DISCONNECT_ERRORS:
-                        client_disconnected = True
-                        stop_event.set()
-                        close_upstream_response()
-
-                        logger.warning(
-                            (
-                                "SSE client disconnected during "
-                                "keepalive model=%r elapsed_seconds=%.1f "
-                                "upstream_idle_seconds=%.1f "
-                                "bytes_sent=%d chunks=%d heartbeats=%d "
-                                "upstream_reader_alive=%s"
-                            ),
+                    self.wfile.write(b": keep-alive\n\n")
+                    self.wfile.flush()
+                    total_heartbeats += 1
+                    last_client_write_at = time.monotonic()
+                    if now - last_alive_log_at >= STREAM_DIAGNOSTIC_ALIVE_LOG_SECONDS:
+                        logger.info(
+                            "SSE relay alive model=%r elapsed_seconds=%.1f "
+                            "upstream_idle_seconds=%.1f client_write_idle_seconds=%.1f "
+                            "bytes_sent=%s chunks_sent=%s heartbeats=%s",
                             model,
                             now - started_at,
-                            now - last_upstream_data_at,
-                            bytes_sent,
-                            chunk_count,
-                            heartbeat_count,
-                            reader.is_alive(),
+                            now - last_upstream_data_at
+                            if last_upstream_data_at is not None
+                            else now - started_at,
+                            now - last_client_write_at,
+                            total_bytes,
+                            total_chunks,
+                            total_heartbeats,
                         )
-                        raise
-
-                    heartbeat_count += 1
-
-                    if (
-                        now - last_status_log
-                        >= 60
-                    ):
-                        logger.info(
-                            (
-                                "SSE relay alive model=%r "
-                                "elapsed_seconds=%d "
-                                "upstream_idle_seconds=%d "
-                                "heartbeats=%d bytes_sent=%d "
-                                "chunks=%d reader_alive=%s"
-                            ),
-                            model,
-                            int(now - started_at),
-                            int(
-                                now - last_upstream_data_at
-                            ),
-                            heartbeat_count,
-                            bytes_sent,
-                            chunk_count,
-                            reader.is_alive(),
-                        )
-
-                        last_status_log = now
-
+                        last_alive_log_at = now
                     continue
 
                 if kind == "done":
+                    completed = True
+                    now = time.monotonic()
                     logger.info(
-                        (
-                            "SSE relay completed model=%r "
-                            "elapsed_seconds=%.1f "
-                            "first_data_seconds=%s "
-                            "bytes_sent=%d chunks=%d "
-                            "heartbeats=%d"
-                        ),
+                        "SSE relay completed model=%r elapsed_seconds=%.1f "
+                        "first_upstream_data_seconds=%s last_upstream_data_idle_seconds=%s "
+                        "last_client_write_idle_seconds=%.3f bytes_sent=%s chunks_sent=%s "
+                        "heartbeats=%s",
                         model,
-                        time.monotonic() - started_at,
-                        (
-                            f"{first_upstream_data_at - started_at:.1f}"
-                            if first_upstream_data_at is not None
-                            else "none"
-                        ),
-                        bytes_sent,
-                        chunk_count,
-                        heartbeat_count,
+                        now - started_at,
+                        f"{first_upstream_data_at - started_at:.3f}"
+                        if first_upstream_data_at is not None
+                        else "none",
+                        f"{now - last_upstream_data_at:.3f}"
+                        if last_upstream_data_at is not None
+                        else "none",
+                        now - last_client_write_at,
+                        total_bytes,
+                        total_chunks,
+                        total_heartbeats,
                     )
                     return
 
                 if kind == "error":
                     exc = value
-
-                    if stop_event.is_set():
-                        return
-
-                    logger.error(
-                        (
-                            "SSE upstream reader failed model=%r "
-                            "elapsed_seconds=%.1f error=%s"
-                        ),
-                        model,
-                        time.monotonic() - started_at,
-                        type(exc).__name__,
-                    )
-
                     if isinstance(exc, BaseException):
                         raise exc
-
-                    raise RuntimeError(
-                        "unknown upstream stream reader error"
-                    )
+                    raise RuntimeError("unknown upstream stream reader error")
 
                 chunk = value
-
                 if not isinstance(chunk, bytes):
-                    raise RuntimeError(
-                        "upstream stream reader returned "
-                        "non-bytes data"
-                    )
-
-                now = time.monotonic()
-
-                last_upstream_data_at = now
+                    raise RuntimeError("upstream stream reader returned non-bytes data")
 
                 if first_upstream_data_at is None:
-                    first_upstream_data_at = now
-
-                    logger.info(
-                        (
-                            "SSE first upstream data model=%r "
-                            "seconds_until_first_data=%.1f"
-                        ),
-                        model,
-                        now - started_at,
-                    )
-
-                if (
-                    warn_on_tool_call_text
-                    and not tool_call_warning_logged
-                    and contains_tool_call_text_leak(chunk)
-                ):
-                    logger.warning(
-                        (
-                            "Streaming response contains "
-                            "plain-text tool_call tags; model=%r"
-                        ),
-                        model,
-                    )
-                    tool_call_warning_logged = True
-
+                    first_upstream_data_at = event_at
+                last_upstream_data_at = event_at
                 try:
+                    if (
+                        warn_on_tool_call_text
+                        and not tool_call_warning_logged
+                        and contains_tool_call_text_leak(chunk)
+                    ):
+                        logger.warning(
+                            "Streaming response contains plain-text tool_call tags. "
+                            "This usually means the selected model is not emitting real OpenAI tool_calls."
+                        )
+                        tool_call_warning_logged = True
                     self.wfile.write(chunk)
                     self.wfile.flush()
-
-                except CLIENT_DISCONNECT_ERRORS:
-                    client_disconnected = True
-                    stop_event.set()
-                    close_upstream_response()
-
+                except (OSError, TimeoutError) as exc:
+                    now = time.monotonic()
                     logger.warning(
-                        (
-                            "SSE client disconnected during data relay "
-                            "model=%r elapsed_seconds=%.1f "
-                            "upstream_idle_seconds=%.1f "
-                            "bytes_sent=%d chunks=%d heartbeats=%d "
-                            "upstream_reader_alive=%s"
-                        ),
+                        "SSE client disconnected during data relay model=%r "
+                        "elapsed_seconds=%.1f upstream_idle_seconds=%.3f "
+                        "client_write_idle_seconds=%.3f bytes_sent=%s chunks_sent=%s "
+                        "heartbeats=%s error=%s",
                         model,
                         now - started_at,
-                        now - last_upstream_data_at,
-                        bytes_sent,
-                        chunk_count,
-                        heartbeat_count,
-                        reader.is_alive(),
+                        now - event_at,
+                        now - last_client_write_at,
+                        total_bytes,
+                        total_chunks,
+                        total_heartbeats,
+                        exc.__class__.__name__,
                     )
-
                     raise
 
-                bytes_sent += len(chunk)
-                chunk_count += 1
-
-        except CLIENT_DISCONNECT_ERRORS:
-            stop_event.set()
-
-            # Closing the upstream response here is intentional.
-            # Without this, the reader thread may remain blocked inside
-            # HTTPResponse.read1() even though JAI has already gone away.
-            close_upstream_response()
-
-            raise
-
+                total_bytes += len(chunk)
+                total_chunks += 1
+                last_client_write_at = time.monotonic()
         finally:
             stop_event.set()
-
-            if client_disconnected:
-                close_upstream_response()
+            if not completed:
+                try:
+                    upstream_response.close()
+                except Exception:
+                    pass
 
     def _relay_remaining_stream_after_headers(
         self,
         upstream_response: http.client.HTTPResponse,
         *,
         warn_on_tool_call_text: bool,
+        model: str | None = None,
     ) -> None:
         """Relay an established stream without attempting a second HTTP status."""
 
@@ -1689,31 +1395,10 @@ class NIMProxyHandler(BaseHTTPRequestHandler):
             self._relay_remaining_stream(
                 upstream_response,
                 warn_on_tool_call_text=warn_on_tool_call_text,
+                model=model,
             )
-
-        except CLIENT_DISCONNECT_ERRORS:
-            logger.info(
-                (
-                    "SSE relay terminated because downstream client "
-                    "disconnected; model=%r"
-                ),
-                getattr(
-                    self,
-                    "_stream_model",
-                    "unknown",
-                ),
-            )
-
-            self.close_connection = True
-            raise
-
         except TimeoutError:
-            logger.error(
-                (
-                    "NVIDIA NIM stream stalled after the response "
-                    "started; closing connection"
-                )
-            )
+            logger.error("NVIDIA NIM stream stalled after the response started; closing connection")
             self.close_connection = True
 
     def _send_proxy_error(
@@ -1724,20 +1409,10 @@ class NIMProxyHandler(BaseHTTPRequestHandler):
         message: str,
         retry_after: str | None = None,
     ) -> None:
-        headers = (
-            {"Retry-After": retry_after}
-            if retry_after is not None
-            else None
-        )
-
+        headers = {"Retry-After": retry_after} if retry_after is not None else None
         self._send_json(
             status_code,
-            {
-                "error": {
-                    "code": code,
-                    "message": message,
-                }
-            },
+            {"error": {"code": code, "message": message}},
             headers=headers,
         )
 
@@ -1748,170 +1423,77 @@ class NIMProxyHandler(BaseHTTPRequestHandler):
         *,
         headers: dict[str, str] | None = None,
     ) -> None:
-        response_body = json.dumps(
-            payload,
-            separators=(",", ":"),
-        ).encode("utf-8")
-
+        response_body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         try:
             NIMProxyHandler._begin_client_response(self)
-
             self.send_response(status_code)
-            self.send_header(
-                "Content-Type",
-                "application/json",
-            )
-
+            self.send_header("Content-Type", "application/json")
             for name, value in (headers or {}).items():
-                self.send_header(
-                    name,
-                    value,
-                )
-
-            self.send_header(
-                "Content-Length",
-                str(len(response_body)),
-            )
-
+                self.send_header(name, value)
+            self.send_header("Content-Length", str(len(response_body)))
             self.end_headers()
             self.wfile.write(response_body)
-
         except CLIENT_DISCONNECT_ERRORS:
-            logger.info(
-                (
-                    "Client disconnected before JSON response "
-                    "could be sent; status=%s"
-                ),
-                status_code,
-            )
+            logger.info("Client disconnected before JSON response could be sent; status=%s", status_code)
 
-    def _send_tool_call_text_diagnostic(
-        self,
-        *,
-        stream: bool,
-    ) -> None:
-        response_body = build_tool_call_text_diagnostic_response(
-            stream=stream
-        )
-
+    def _send_tool_call_text_diagnostic(self, *, stream: bool) -> None:
+        response_body = build_tool_call_text_diagnostic_response(stream=stream)
         try:
             NIMProxyHandler._begin_client_response(self)
-
             self.send_response(200)
-            self.send_header(
-                "Cache-Control",
-                "no-cache",
-            )
-
+            self.send_header("Cache-Control", "no-cache")
             if stream:
-                self.send_header(
-                    "Content-Type",
-                    "text/event-stream",
-                )
+                self.send_header("Content-Type", "text/event-stream")
             else:
-                self.send_header(
-                    "Content-Type",
-                    "application/json",
-                )
-                self.send_header(
-                    "Content-Length",
-                    str(len(response_body)),
-                )
-
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(response_body)))
             self.end_headers()
             self.wfile.write(response_body)
             self.wfile.flush()
-
         except CLIENT_DISCONNECT_ERRORS:
-            logger.info(
-                "Client disconnected before diagnostic response could be sent"
-            )
+            logger.info("Client disconnected before diagnostic response could be sent")
 
 
-def build_server(
-    host: str,
-    port: int,
-    config: ProxyConfig,
-) -> NIMProxyServer:
+def build_server(host: str, port: int, config: ProxyConfig) -> NIMProxyServer:
     """Build a configured HTTP server instance."""
 
     class ConfiguredNIMProxyHandler(NIMProxyHandler):
         pass
 
     ConfiguredNIMProxyHandler.config = config
-
-    server = NIMProxyServer(
-        (host, port),
-        ConfiguredNIMProxyHandler,
-    )
-
+    server = NIMProxyServer((host, port), ConfiguredNIMProxyHandler)
     server.model_catalog = config.model_catalog
-
     return server
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Run the ZCode NVIDIA NIM compatibility proxy."
-    )
-
-    parser.add_argument(
-        "--host",
-        default=os.getenv(
-            "NIM_PROXY_HOST",
-            DEFAULT_HOST,
-        ),
-    )
-
+    parser = argparse.ArgumentParser(description="Run the ZCode NVIDIA NIM compatibility proxy.")
+    parser.add_argument("--host", default=os.getenv("NIM_PROXY_HOST", DEFAULT_HOST))
     parser.add_argument(
         "--port",
         type=valid_port,
-        default=os.getenv(
-            "NIM_PROXY_PORT",
-            str(DEFAULT_PORT),
-        ),
+        default=os.getenv("NIM_PROXY_PORT", str(DEFAULT_PORT)),
     )
-
     parser.add_argument(
         "--upstream-base-url",
-        default=os.getenv(
-            "NIM_PROXY_UPSTREAM_BASE_URL",
-            DEFAULT_UPSTREAM_BASE_URL,
-        ),
+        default=os.getenv("NIM_PROXY_UPSTREAM_BASE_URL", DEFAULT_UPSTREAM_BASE_URL),
         help="NVIDIA NIM OpenAI-compatible base URL.",
     )
-
     parser.add_argument(
         "--tool-call-text-mode",
         choices=("diagnostic", "pass"),
-        default=os.getenv(
-            "NIM_PROXY_TOOL_CALL_TEXT_MODE",
-            "diagnostic",
-        ),
-        help=(
-            "How to handle model output that contains "
-            "plain-text <tool_call> markup."
-        ),
+        default=os.getenv("NIM_PROXY_TOOL_CALL_TEXT_MODE", "diagnostic"),
+        help="How to handle model output that contains plain-text <tool_call> markup.",
     )
-
     parser.add_argument(
         "--api-key-mode",
-        choices=(
-            API_KEY_MODE_ENV,
-            API_KEY_MODE_CLIENT,
-            API_KEY_MODE_POOL,
-        ),
-        default=os.getenv(
-            "NIM_PROXY_API_KEY_MODE",
-            API_KEY_MODE_ENV,
-        ),
+        choices=(API_KEY_MODE_ENV, API_KEY_MODE_CLIENT, API_KEY_MODE_POOL),
+        default=os.getenv("NIM_PROXY_API_KEY_MODE", API_KEY_MODE_ENV),
         help=(
-            "Use 'env' for NVIDIA_API_KEY, 'client' for each "
-            "ZCode provider key, or 'pool' for a local bearer "
-            "token backed by numbered NVIDIA keys."
+            "Use 'env' for NVIDIA_API_KEY, 'client' for each ZCode provider key, "
+            "or 'pool' for a local bearer token backed by numbered NVIDIA keys."
         ),
     )
-
     parser.add_argument(
         "--upstream-timeout-seconds",
         type=positive_int,
@@ -1919,12 +1501,8 @@ def parse_args() -> argparse.Namespace:
             "NIM_PROXY_UPSTREAM_TIMEOUT_SECONDS",
             str(DEFAULT_UPSTREAM_TIMEOUT_SECONDS),
         ),
-        help=(
-            "Seconds to wait for NVIDIA NIM to start responding "
-            "before returning 504."
-        ),
+        help="Seconds to wait for NVIDIA NIM to start responding before returning 504.",
     )
-
     parser.add_argument(
         "--max-concurrent-per-key",
         type=positive_int,
@@ -1932,11 +1510,8 @@ def parse_args() -> argparse.Namespace:
             "NIM_PROXY_MAX_CONCURRENT_PER_KEY",
             str(DEFAULT_MAX_CONCURRENT_PER_KEY),
         ),
-        help=(
-            "Maximum active upstream requests for one NVIDIA key."
-        ),
+        help="Maximum active upstream requests for one NVIDIA key.",
     )
-
     parser.add_argument(
         "--max-queue-per-key",
         type=positive_int,
@@ -1944,12 +1519,8 @@ def parse_args() -> argparse.Namespace:
             "NIM_PROXY_MAX_QUEUE_PER_KEY",
             str(DEFAULT_MAX_QUEUE_PER_KEY),
         ),
-        help=(
-            "Maximum waiting requests for one client/env "
-            "NVIDIA key."
-        ),
+        help="Maximum waiting requests for one client/env NVIDIA key.",
     )
-
     parser.add_argument(
         "--max-total-queued",
         type=positive_int,
@@ -1957,11 +1528,8 @@ def parse_args() -> argparse.Namespace:
             "NIM_PROXY_MAX_TOTAL_QUEUED",
             str(DEFAULT_MAX_TOTAL_QUEUED),
         ),
-        help=(
-            "Maximum waiting requests across the proxy process."
-        ),
+        help="Maximum waiting requests across the proxy process.",
     )
-
     parser.add_argument(
         "--queue-wait-seconds",
         type=positive_int,
@@ -1969,11 +1537,8 @@ def parse_args() -> argparse.Namespace:
             "NIM_PROXY_QUEUE_WAIT_SECONDS",
             str(DEFAULT_QUEUE_WAIT_SECONDS),
         ),
-        help=(
-            "Maximum time a request may wait for queue admission."
-        ),
+        help="Maximum time a request may wait for queue admission.",
     )
-
     parser.add_argument(
         "--rate-limit-cooldown-seconds",
         type=positive_int,
@@ -1981,12 +1546,8 @@ def parse_args() -> argparse.Namespace:
             "NIM_PROXY_RATE_LIMIT_COOLDOWN_SECONDS",
             str(DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS),
         ),
-        help=(
-            "Fallback NVIDIA key cooldown when Retry-After "
-            "is absent."
-        ),
+        help="Fallback NVIDIA key cooldown when Retry-After is absent.",
     )
-
     parser.add_argument(
         "--max-5xx-failovers",
         type=non_negative_int,
@@ -1994,106 +1555,52 @@ def parse_args() -> argparse.Namespace:
             "NIM_PROXY_MAX_5XX_FAILOVERS",
             str(DEFAULT_MAX_5XX_FAILOVERS),
         ),
-        help=(
-            "Alternate NVIDIA keys tried after an upstream "
-            "5xx or transport error."
-        ),
+        help="Alternate NVIDIA keys tried after an upstream 5xx or transport error.",
     )
-
     parser.add_argument(
         "--allow-remote",
         action="store_true",
-        help=(
-            "Allow binding to a non-loopback host. Unsafe "
-            "with env API key mode."
-        ),
+        help="Allow binding to a non-loopback host. Unsafe with env API key mode.",
     )
-
+    parser.add_argument("--debug", action="store_true", help="Enable debug-safe request logging.")
     parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Enable debug-safe request logging.",
+        "--no-model-discovery", action="store_true",
+        help="Disable public NVIDIA model catalog refresh and /v1/models.",
     )
-
     parser.add_argument(
-        "--no-model-discovery",
-        action="store_true",
-        help=(
-            "Disable public NVIDIA model catalog refresh "
-            "and /v1/models."
-        ),
+        "--model-refresh-seconds", type=positive_int, default=DEFAULT_REFRESH_SECONDS,
+        help="Public catalog refresh interval (minimum 30 seconds, default 21600).",
     )
-
     parser.add_argument(
-        "--model-refresh-seconds",
-        type=positive_int,
-        default=DEFAULT_REFRESH_SECONDS,
-        help=(
-            "Public catalog refresh interval "
-            "(minimum 30 seconds, default 21600)."
-        ),
+        "--opencode-config", type=Path,
+        help="Opt in to add-only nim-local model sync in this OpenCode .json file.",
     )
-
-    parser.add_argument(
-        "--opencode-config",
-        type=Path,
-        help=(
-            "Opt in to add-only nim-local model sync "
-            "in this OpenCode .json file."
-        ),
-    )
-
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-
     logging.basicConfig(
-        level=(
-            logging.DEBUG
-            if args.debug
-            else logging.INFO
-        ),
-        format=(
-            "%(asctime)s %(levelname)s "
-            "%(name)s %(message)s"
-        ),
+        level=logging.DEBUG if args.debug else logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
 
     api_key = os.getenv("NVIDIA_API_KEY")
-
-    if (
-        args.api_key_mode == API_KEY_MODE_ENV
-        and not api_key
-    ):
-        raise SystemExit(
-            "NVIDIA_API_KEY is required"
-        )
-
-    local_client_key = os.getenv(
-        "NIM_PROXY_CLIENT_KEY"
-    )
-
+    if args.api_key_mode == API_KEY_MODE_ENV and not api_key:
+        raise SystemExit("NVIDIA_API_KEY is required")
+    local_client_key = os.getenv("NIM_PROXY_CLIENT_KEY")
     pool_keys: tuple[str, ...] = ()
-
     if args.api_key_mode == API_KEY_MODE_POOL:
         if not local_client_key:
-            raise SystemExit(
-                "NIM_PROXY_CLIENT_KEY is required in pool mode"
-            )
-
+            raise SystemExit("NIM_PROXY_CLIENT_KEY is required in pool mode")
         try:
             pool_keys = load_pool_keys(os.environ)
         except ValueError as exc:
             raise SystemExit(str(exc)) from exc
-
         if local_client_key in pool_keys:
             raise SystemExit(
-                "NIM_PROXY_CLIENT_KEY must be different "
-                "from every NVIDIA API key"
+                "NIM_PROXY_CLIENT_KEY must be different from every NVIDIA API key"
             )
-
     try:
         validate_bind_security(
             args.host,
@@ -2105,50 +1612,17 @@ def main() -> None:
 
     try:
         catalog: ModelCatalog | None = None
-
-        public_upstream = (
-            args.upstream_base_url.rstrip("/")
-            == DEFAULT_UPSTREAM_BASE_URL
-        )
-
-        if (
-            args.opencode_config
-            and (
-                args.no_model_discovery
-                or not public_upstream
-            )
-        ):
-            raise ValueError(
-                "OpenCode sync requires discovery against "
-                "the public NVIDIA endpoint"
-            )
-
-        if (
-            not args.no_model_discovery
-            and public_upstream
-        ):
-            if (
-                args.opencode_config
-                and not is_loopback_host(args.host)
-            ):
-                raise ValueError(
-                    "OpenCode GUI sync requires a loopback proxy host"
-                )
-
+        public_upstream = args.upstream_base_url.rstrip("/") == DEFAULT_UPSTREAM_BASE_URL
+        if args.opencode_config and (args.no_model_discovery or not public_upstream):
+            raise ValueError("OpenCode sync requires discovery against the public NVIDIA endpoint")
+        if not args.no_model_discovery and public_upstream:
+            if args.opencode_config and not is_loopback_host(args.host):
+                raise ValueError("OpenCode GUI sync requires a loopback proxy host")
             sync = (
-                OpenCodeModelSync(
-                    args.opencode_config,
-                    f"http://{args.host}:{args.port}/v1",
-                )
-                if args.opencode_config
-                else None
+                OpenCodeModelSync(args.opencode_config, f"http://{args.host}:{args.port}/v1")
+                if args.opencode_config else None
             )
-
-            catalog = ModelCatalog(
-                refresh_seconds=args.model_refresh_seconds,
-                on_refresh=sync,
-            )
-
+            catalog = ModelCatalog(refresh_seconds=args.model_refresh_seconds, on_refresh=sync)
         config = ProxyConfig(
             upstream_base_url=args.upstream_base_url,
             api_key=api_key,
@@ -2161,97 +1635,37 @@ def main() -> None:
             max_queue_per_key=args.max_queue_per_key,
             max_total_queued=args.max_total_queued,
             queue_wait_seconds=args.queue_wait_seconds,
-            rate_limit_cooldown_seconds=(
-                args.rate_limit_cooldown_seconds
-            ),
+            rate_limit_cooldown_seconds=args.rate_limit_cooldown_seconds,
             max_5xx_failovers=args.max_5xx_failovers,
             model_catalog=catalog,
         )
-
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
-
-    server = build_server(
-        args.host,
-        args.port,
-        config,
-    )
-
+    server = build_server(args.host, args.port, config)
     if catalog is not None:
         catalog.start()
-        logger.info(
-            (
-                "Model discovery enabled: background "
-                "refresh every %s seconds"
-            ),
-            args.model_refresh_seconds,
-        )
+        logger.info("Model discovery enabled: background refresh every %s seconds", args.model_refresh_seconds)
     else:
-        logger.info(
-            (
-                "Model discovery disabled "
-                "(requested or non-public upstream)"
-            )
-        )
-
+        logger.info("Model discovery disabled (requested or non-public upstream)")
     if args.opencode_config:
-        logger.info(
-            (
-                "OpenCode GUI model sync enabled: "
-                "add-only, existing entries preserved"
-            )
-        )
-
+        logger.info("OpenCode GUI model sync enabled: add-only, existing entries preserved")
+    logger.info("Listening on http://%s:%s/v1", args.host, args.port)
+    logger.info("Forwarding sanitized requests to %s", args.upstream_base_url)
+    logger.info("Plain-text tool_call handling mode: %s", args.tool_call_text_mode)
+    logger.info("API key mode: %s", args.api_key_mode)
+    logger.info("Upstream timeout: %s seconds", args.upstream_timeout_seconds)
     logger.info(
-        "Listening on http://%s:%s/v1",
-        args.host,
-        args.port,
-    )
-
-    logger.info(
-        "Forwarding sanitized requests to %s",
-        args.upstream_base_url,
-    )
-
-    logger.info(
-        "Plain-text tool_call handling mode: %s",
-        args.tool_call_text_mode,
-    )
-
-    logger.info(
-        "API key mode: %s",
-        args.api_key_mode,
-    )
-
-    logger.info(
-        "Upstream timeout: %s seconds",
-        args.upstream_timeout_seconds,
-    )
-
-    logger.info(
-        (
-            "Queue limits: per_key_active=%s "
-            "per_key_waiting=%s total_waiting=%s "
-            "wait_seconds=%s"
-        ),
+        "Queue limits: per_key_active=%s per_key_waiting=%s total_waiting=%s wait_seconds=%s",
         args.max_concurrent_per_key,
         args.max_queue_per_key,
         args.max_total_queued,
         args.queue_wait_seconds,
     )
-
     if args.api_key_mode == API_KEY_MODE_POOL:
-        logger.info(
-            "Loaded NVIDIA key pool entries: %s",
-            len(pool_keys),
-        )
-
+        logger.info("Loaded NVIDIA key pool entries: %s", len(pool_keys))
     if not is_loopback_host(args.host):
         logger.warning(
-            (
-                "Remote %s-mode proxy binding enabled on %s; "
-                "use TLS termination and firewall controls"
-            ),
+            "Remote %s-mode proxy binding enabled on %s; use TLS termination and firewall controls",
             args.api_key_mode,
             args.host,
         )
